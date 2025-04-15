@@ -1,7 +1,11 @@
 use crate::init::{create_instance, create_vulkan_entry};
 use anyhow::anyhow;
 use std::collections::BTreeMap;
-use vulkanalia::vk::{DeviceV1_0, ExtDebugUtilsExtension, Handle, InstanceV1_0, PhysicalDeviceProperties, PhysicalDeviceType};
+use vulkanalia::vk::{
+    DeviceV1_0, ExtDebugUtilsExtension, Handle, InstanceV1_0, KhrSurfaceExtension
+    , PhysicalDeviceProperties, PhysicalDeviceType,
+};
+use vulkanalia::window::create_surface;
 use vulkanalia::{vk, Device, Entry, Instance};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -12,18 +16,19 @@ use winit::window::{Window, WindowId};
 
 ///
 pub struct QueueFamilyIndices {
-    graphics_family: Option<u32>
+    pub graphics_family: Option<u32>,
+    pub present_family: Option<u32>,
 }
 
 impl QueueFamilyIndices {
     pub fn is_complete(&self) -> bool {
-        self.graphics_family.is_some()
+        self.graphics_family.is_some() && self.present_family.is_some()
     }
 }
 
 /// A struct containing some engine data for holding utilities, etc.
 pub struct VEngineData {
-    pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>
+    pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
 }
 
 /// The primary engine for running the Vulkan instance, managing window creation, and handling
@@ -36,8 +41,11 @@ pub struct VulkanEngine {
     pub physical_device: vk::PhysicalDevice,
     pub logical_device: Option<Device>,
     pub graphics_queue: vk::Queue,
+    pub presentation_queue: vk::Queue,
     pub graphics_queue_index_count: u32,
-    pub data: VEngineData
+    pub present_queue_index_count: u32,
+    pub data: VEngineData,
+    pub surface: vk::SurfaceKHR,
 }
 
 impl VulkanEngine {
@@ -45,15 +53,20 @@ impl VulkanEngine {
         use vk::Handle;
 
         Self {
+            data: VEngineData {
+                debug_messenger: None,
+            },
             should_continue: false,
             entry: unsafe { create_vulkan_entry() },
             instance: None,
             window: None,
-            physical_device: vk::PhysicalDevice::null(),
-            logical_device: None,
-            graphics_queue: vk::Queue::null(),
             graphics_queue_index_count: 0,
-            data: VEngineData { debug_messenger: None }
+            present_queue_index_count: 0,
+            logical_device: None,
+            physical_device: vk::PhysicalDevice::null(),
+            graphics_queue: vk::Queue::null(),
+            presentation_queue: vk::Queue::null(),
+            surface: vk::SurfaceKHR::null(),
         }
     }
 
@@ -68,9 +81,7 @@ impl VulkanEngine {
                 dbg!(&window_id);
             }
 
-            _ => {
-
-            }
+            _ => {}
         }
     }
 
@@ -78,10 +89,12 @@ impl VulkanEngine {
     ///
     /// https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/00_Setup/04_Logical_device_and_queues.html
     fn create_logical_device(&mut self) -> Result<(), anyhow::Error> {
-        use vk::{HasBuilder};
+        use vk::HasBuilder;
 
         if self.instance.is_none() {
-            return Err(anyhow!("Instance not initialized. Unable to create a logical device."));
+            return Err(anyhow!(
+                "Instance not initialized. Unable to create a logical device."
+            ));
         }
         let instance = self.instance.as_ref().unwrap();
 
@@ -89,12 +102,33 @@ impl VulkanEngine {
 
         // Specify our device queue information.
         let indices = self.find_queue_families(&self.physical_device)?;
-        let device_queue_create_info = vk::DeviceQueueCreateInfo::builder()
-            .queue_family_index(indices.graphics_family.unwrap())
-            .queue_priorities(&[1.0f32]); // Allows for assigning priorities to different queues.
 
-        // Need to wrap our device queue infos in an array to pass to the builder.
-        let device_queue_create_infos = [device_queue_create_info];
+        let mut device_queue_create_infos = Vec::new();
+
+        // Create the graphics pipeline. This one is a priority queue, and should always be
+        // instantiated.
+        if let Some(graphics) = indices.graphics_family {
+            // Create the queue info for the graphics queue.
+            let gqci = vk::DeviceQueueCreateInfo::builder()
+                .queue_family_index(graphics)
+                .queue_priorities(&[1.0f32]); // Allows for assigning priorities to different queues.
+
+            device_queue_create_infos.push(gqci);
+        }
+
+        // Create the present family. If the graphics family has the same queue family
+        // index as the present family, then this present family won't get added, since the
+        // two queues families are part of the same queue.
+        if let Some(present) = indices.present_family {
+            if device_queue_create_infos.get(present as usize).is_none() {
+                // Create the queue info for the presentation queue.
+                let pqci = vk::DeviceQueueCreateInfo::builder()
+                    .queue_family_index(indices.present_family.unwrap())
+                    .queue_priorities(&[1.0f32]);
+
+                device_queue_create_infos.push(pqci);
+            }
+        }
 
         // Creates a queue info builder for the graphics queue.
         let device_create_info = vk::DeviceCreateInfo::builder()
@@ -103,29 +137,39 @@ impl VulkanEngine {
 
         // Attempt to get a logical `vk::Device` handle to the physical graphics device.
         let logical_device = unsafe {
-            instance.create_device(self.physical_device, &device_create_info, None)
-               .map_err(|e| anyhow!(e))?
+            instance
+                .create_device(self.physical_device, &device_create_info, None)
+                .map_err(|e| anyhow!(e))?
         };
 
         self.logical_device = Some(logical_device);
 
-        // Check to make sure the logical device is initialized (1000% should be), and get the
-        self.graphics_queue = unsafe {
+        // Check to make sure the logical device is initialized (1000% should be), and get our
+        // required queues.
+        unsafe {
             let l_device = self.logical_device.as_ref();
 
             if l_device.is_some() {
                 let l_device = l_device.unwrap();
 
-                let queue = l_device.get_device_queue(
+                let graphics_queue = l_device.get_device_queue(
                     indices.graphics_family.unwrap(),
-                    self.graphics_queue_index_count
+                    self.graphics_queue_index_count,
+                );
+
+                let presentation_queue = l_device.get_device_queue(
+                    indices.present_family.unwrap(),
+                    self.present_queue_index_count,
                 );
 
                 self.graphics_queue_index_count += 1;
+                self.present_queue_index_count += 1;
 
-                queue
+                self.graphics_queue = graphics_queue;
+                self.presentation_queue = presentation_queue;
             } else {
-                vk::Queue::null()
+                self.graphics_queue = vk::Queue::null();
+                self.presentation_queue = vk::Queue::null();
             }
         };
 
@@ -144,7 +188,8 @@ impl VulkanEngine {
         if self.instance.is_some() {
             let instance = self.instance.as_ref().unwrap();
             let devices = unsafe {
-                instance.enumerate_physical_devices()
+                instance
+                    .enumerate_physical_devices()
                     .map_err(|e| anyhow!(e))?
             };
 
@@ -173,7 +218,9 @@ impl VulkanEngine {
 
             self.physical_device = *suitable_device.unwrap().1;
         } else {
-            return Err(anyhow!("Instance not initialized. Unable to check for physical devices."))
+            return Err(anyhow!(
+                "Instance not initialized. Unable to check for physical devices."
+            ));
         }
 
         Ok(())
@@ -185,17 +232,15 @@ impl VulkanEngine {
     fn get_device_score(&self, device: &vk::PhysicalDevice) -> Result<u32, anyhow::Error> {
         // Ensure the Vulkan instance is still initialized.
         if self.instance.is_none() {
-            return Err(anyhow!("Instance not initialized. Unable to query physical device for properties."));
+            return Err(anyhow!(
+                "Instance not initialized. Unable to query physical device for properties."
+            ));
         }
 
         let instance = self.instance.as_ref().unwrap();
-        let properties = unsafe {
-            instance.get_physical_device_properties(*device)
-        };
+        let properties = unsafe { instance.get_physical_device_properties(*device) };
 
-        let features = unsafe {
-            instance.get_physical_device_features(*device)
-        };
+        let features = unsafe { instance.get_physical_device_features(*device) };
 
         let score = self.score_physical_device(&properties, &features);
 
@@ -206,7 +251,11 @@ impl VulkanEngine {
     /// device's score based on necessary application requirements.
     ///
     /// https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/00_Setup/03_Physical_devices_and_queue_families.html
-    fn score_physical_device(&self, p: &PhysicalDeviceProperties, f: &vk::PhysicalDeviceFeatures) -> u32 {
+    fn score_physical_device(
+        &self,
+        p: &PhysicalDeviceProperties,
+        f: &vk::PhysicalDeviceFeatures,
+    ) -> u32 {
         // If the geometry shader feature is not supported, return 0.
         if f.geometry_shader == vk::FALSE {
             0
@@ -229,19 +278,26 @@ impl VulkanEngine {
     /// family that does not exist.
     ///
     /// https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/00_Setup/03_Physical_devices_and_queue_families.html
-    fn find_queue_families(&self, device: &vk::PhysicalDevice) -> Result<QueueFamilyIndices, anyhow::Error> {
+    fn find_queue_families(
+        &self,
+        device: &vk::PhysicalDevice,
+    ) -> Result<QueueFamilyIndices, anyhow::Error> {
         if self.instance.is_none() {
-            return Err(anyhow!("Instance is not initialized. Unable to find device queue families."));
+            return Err(anyhow!(
+                "Instance is not initialized. Unable to find device queue families."
+            ));
         }
 
         let instance = self.instance.as_ref().unwrap();
 
-        let queue_family_properties = unsafe {
-            instance.get_physical_device_queue_family_properties(*device)
-        };
+        let queue_family_properties =
+            unsafe { instance.get_physical_device_queue_family_properties(*device) };
 
         let mut i = 0;
-        let mut indices = QueueFamilyIndices { graphics_family: None };
+        let mut indices = QueueFamilyIndices {
+            graphics_family: None,
+            present_family: None,
+        };
 
         // Iterate through the physical device's queue families. For each queue family flag we find
         // that we need, set the `QueueFamilyIndices` family to the index of the queue family on the
@@ -249,6 +305,17 @@ impl VulkanEngine {
         for p in queue_family_properties {
             if vk::QueueFlags::contains(&p.queue_flags, vk::QueueFlags::GRAPHICS) {
                 indices.graphics_family = Some(i);
+            }
+
+            // Check to ensure the device contains support for window surfaces.
+            let surface_support = unsafe {
+                instance
+                    .get_physical_device_surface_support_khr(*device, i, self.surface)
+                    .map_err(|e| anyhow!(e))?
+            };
+
+            if surface_support == true {
+                indices.present_family = Some(i);
             }
 
             if indices.is_complete() {
@@ -261,19 +328,50 @@ impl VulkanEngine {
         Ok(indices)
     }
 
+    /// Initializes a platform-agnostic window surface for Vulkan. Vulkanalia can handle this
+    /// creation directly, utilizing the `create_surface` function. This can also be done for
+    /// platform-specific implementations, utilizing the other instance create surface functions.
+    ///
+    /// https://docs.vulkan.org/tutorial/latest/03_Drawing_a_triangle/01_Presentation/00_Window_surface.html
+    fn init_window_surface(&mut self) -> Result<(), anyhow::Error> {
+        let window = self.window.as_ref();
+        let window = if let Some(window) = window {
+            window
+        } else {
+            return Err(anyhow!("No window exists to create a surface for."));
+        };
+
+        if let Some(instance) = self.instance.as_ref() {
+            // Platform-agnostic window surface creation.
+            let surface_khr =
+                unsafe { create_surface(instance, window, window).map_err(|e| anyhow!(e))? };
+
+            self.surface = surface_khr;
+
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "Instance has not been initialized. Unable to initialize a window surface."
+            ))
+        }
+    }
+
     /// Initializes Vulkan, creating an instance.
     fn init_vulkan(&mut self) -> Result<(), anyhow::Error> {
         // Make sure `self.window` has been initialized. Vulkan cannot be initialized without
         // a window.
-        let window_ref = self.window.as_ref()
-            .ok_or(anyhow!("Can't create an instance without first having a valid window!"))?;
+        let window_ref = self.window.as_ref().ok_or(anyhow!(
+            "Can't create an instance without first having a valid window!"
+        ))?;
 
         // Attempt to create an instance.
-        let instance = create_instance(window_ref, &self.entry, &mut self.data)
-            .map_err(|e| anyhow!(e))?;
+        let instance =
+            create_instance(window_ref, &self.entry, &mut self.data).map_err(|e| anyhow!(e))?;
 
         // Take ownership of the instance within the engine.
         self.instance = Some(instance);
+
+        self.init_window_surface()?;
 
         // Get a handle to a suitable physical device.
         self.pick_physical_device()?;
@@ -299,12 +397,17 @@ impl VulkanEngine {
                 l_device.destroy_device(None);
             }
 
+            // Destroy the attached window surface.
+            instance.destroy_surface_khr(self.surface, None);
+
             // Destroy the internal debug messenger structure.
             instance.destroy_debug_utils_messenger_ext(self.data.debug_messenger.unwrap(), None);
         }
 
         // Destroy the Vulkan instance.
-        unsafe { self.instance.as_ref().unwrap().destroy_instance(None); }
+        unsafe {
+            self.instance.as_ref().unwrap().destroy_instance(None);
+        }
 
         // Internally flag that the engine is no longer accepting calls.
         self.should_continue = false;
@@ -337,7 +440,12 @@ impl ApplicationHandler for VulkanEngine {
         self.init_vulkan().unwrap();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
         &self.run(event_loop, window_id, event);
     }
 }
