@@ -1,10 +1,18 @@
 mod engine;
 mod init;
+mod shaders;
 
+use std::ffi::{c_char, CStr};
+use vulkanalia::vk;
+use vulkanalia::vk::StringArray;
 use crate::engine::VulkanEngine;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 pub const VALIDATION_ENABLED: bool = true;
+pub const REQUIRED_EXTENSIONS: [StringArray<256>; 1] = [
+    vk::KHR_SWAPCHAIN_EXTENSION.name
+];
+
 
 fn main() {
     if VALIDATION_ENABLED == true {
